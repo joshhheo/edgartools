@@ -27,7 +27,9 @@ from edgar.exceptions import ValidationError
 from edgar.datatools import STR_DTYPE, null_column as _null_column
 from edgar.richtools import repr_rich
 from edgar.xbrl.core import STANDARD_LABEL, element_catalog_key, iso4217_code, parse_date, unit_currency
+from edgar.xbrl.enumerations import ENUMERATION_SET_ITEM_TYPE
 from edgar.xbrl.models import NIL_MEMBER_LABEL, is_negated_label_role, select_display_label
+from edgar.xbrl.parsers.concepts import get_standard_declaration
 
 
 # Probed once in edgar.datatools, where the entity path's declared schema reads it
@@ -141,7 +143,7 @@ def _source_column_presence(results: List[Dict[str, Any]], names) -> set:
     return present
 
 
-def _deduplicate_facts(df: pd.DataFrame) -> pd.DataFrame:
+def _deduplicate_facts(df: pd.DataFrame, element_catalog=None) -> pd.DataFrame:
     """
     Remove true duplicate facts from a DataFrame.
 
@@ -169,7 +171,27 @@ def _deduplicate_facts(df: pd.DataFrame) -> pd.DataFrame:
     if all(col in df.columns for col in dedup_cols):
         # Repeated tags of one fact still collapse (gh #769): they share a unit.
         dedup_cols.extend(col for col in _DEDUP_OPTIONAL if col in df.columns)
-        df = df.drop_duplicates(subset=dedup_cols, keep='first')
+        # Compare enumeration sets on their whitespace-collapsed values while
+        # keeping the first fact's original text in the returned frame.
+        keys = df[dedup_cols]
+        candidates = keys['value'].map(
+            lambda value: isinstance(value, str) and '#' in value and any(c in value for c in ' \t\r\n')
+        )
+        enum_concepts = set()
+        for concept in keys.loc[candidates, 'concept'].dropna().unique():
+            element = (element_catalog or {}).get(element_catalog_key(concept))
+            data_type = element.data_type if element is not None else None
+            if not data_type:
+                data_type = (get_standard_declaration(concept) or {}).get('type')
+            if data_type and data_type.rsplit(':', 1)[-1].rsplit('}', 1)[-1] == ENUMERATION_SET_ITEM_TYPE:
+                enum_concepts.add(concept)
+        if enum_concepts:
+            enum_rows = candidates & keys['concept'].isin(enum_concepts)
+            keys = keys.copy()
+            keys.loc[enum_rows, 'value'] = keys.loc[enum_rows, 'value'].map(
+                lambda value: re.sub(r'[ \t\r\n]+', ' ', value).strip(' ')
+            )
+        df = df.loc[~keys.duplicated(keep='first')]
     return df
 
 
@@ -1196,8 +1218,9 @@ class FactQuery:
         one place and off that method's branch count.
         """
         frame_columns = self._projection_source_columns(columns, results)
+        catalog = getattr(getattr(self._facts_view, 'xbrl', None), 'element_catalog', None)
         if frame_columns is None:
-            return _deduplicate_facts(pd.DataFrame(results))
+            return _deduplicate_facts(pd.DataFrame(results), catalog)
 
         df = pd.DataFrame(results, columns=frame_columns)
         # Only de-duplicate when the full-width frame would have. Constructing with
@@ -1205,7 +1228,7 @@ class FactQuery:
         # otherwise switch de-duplication ON for a source that is missing one of
         # the identity columns.
         if all(col in frame_columns for col in _DEDUP_REQUIRED):
-            df = _deduplicate_facts(df)
+            df = _deduplicate_facts(df, catalog)
         return df
 
     def to_pandas(self, *args, **kwargs) -> pd.DataFrame:
@@ -1727,7 +1750,7 @@ class FactsView:
 
         facts = self.get_facts()
         df = pd.DataFrame(facts)
-        df = _deduplicate_facts(df)
+        df = _deduplicate_facts(df, self.xbrl.element_catalog)
         self._facts_df_cache = df
         return df
 
